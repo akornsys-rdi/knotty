@@ -1,0 +1,147 @@
+#!/bin/bash
+
+# EXIT STATUS
+#   0   OK
+#   1   FALLO EN ARGUMENTO
+#   2   FALLO EN BASE DE DATOS
+#   3   FALLO EN KNOTTY_DIR
+
+KNOTTY_VERSION=0.0.1
+KNOTTY_DIR=~/.knotty
+
+usage() {
+cat << EOF
+usage: $0 options
+
+OPTIONS:
+  -i    Install apps from profile
+  -c    Check for updates
+  -u    Upgrade packages if available
+  -h    Show this message
+  -v    Show version and quit
+EOF
+}
+
+check_db() {
+if [ -f $KNOTTY_DIR/knotty.db ]; then #si el archivo de la base de datos existe
+    if [ "`sqlite3 -batch -list $KNOTTY_DIR/knotty.db 'SELECT version FROM status'`" == "$KNOTTY_VERSION" ]; then #comprueba su version
+        echo -e "Base de datos encontrada." #si coincide con la del script es OK
+    else
+        echo -e "La base de datos parece corrupta, no se puede efectuar la operación." >&2 #si no coincide ERROR 2
+        exit 2
+    fi
+else #si no existe crea el archivo y las tablas
+echo -e "Base de datos inexistente, creando tablas..."
+sqlite3 -batch $KNOTTY_DIR/knotty.db << EOF
+CREATE TABLE "sourcefiles" ("id" INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,"filename" TEXT NOT NULL,"hash" TEXT NOT NULL);
+CREATE TABLE "sources" ("id" INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,"type" TEXT NOT NULL,"alias" TEXT,"uri" TEXT NOT NULL,"gpgkey" TEXT,"version" TEXT);
+CREATE TABLE "status" ("id" INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,"last_modification" TEXT NOT NULL,"version" TEXT NOT NULL);
+EOF
+sqlite3 -batch $KNOTTY_DIR/knotty.db 'INSERT INTO status (ID,last_modification,version) VALUES (1,'\'$(date +%s)\'','\'$KNOTTY_VERSION\'')'
+fi
+}
+
+check_sourcefile() {
+if [ -d $KNOTTY_DIR/sources.d ]; then #si existe el directorio sources.d
+    #TODO no se pueden borrar las entradas previas en la db, actualizarlas
+    #vacia las tablas de fuentes
+    sqlite3 -batch $KNOTTY_DIR/knotty.db 'DELETE FROM sources'
+    sqlite3 -batch $KNOTTY_DIR/knotty.db 'DELETE FROM sourcefiles'
+    for f in $(ls -A $KNOTTY_DIR/sources.d/); do #por cada archivo en sources.d
+        if [ "`sqlite3 -batch $KNOTTY_DIR/knotty.db 'SELECT * FROM sourcefiles WHERE filename = '\'$f\'' AND hash = '\'$(md5sum $KNOTTY_DIR/sources.d/$f | cut -c 1-32)\'`" == "" ]; then #si el archivo no existe en tabla sourcefiles
+            echo -e "Procesando archivo de fuentes $f."
+            sqlite3 -batch -csv $KNOTTY_DIR/knotty.db '.import '$KNOTTY_DIR/sources.d/$f' sources' #lo importa a tabla sources
+            sqlite3 -batch $KNOTTY_DIR/knotty.db 'INSERT INTO sourcefiles (filename, hash) VALUES ('\'$f\'','\'$(md5sum $KNOTTY_DIR/sources.d/$f | cut -c 1-32)\'')' #actualiza tabla sourcefiles
+            sqlite3 -batch $KNOTTY_DIR/knotty.db 'UPDATE status SET last_modification='$(date +%s)' WHERE ID=1' #actualiza tabla status
+        fi
+    done
+else
+    echo -e "Error accediendo al directorio de knotty." >&2 # si no existe el directorio ERROR 3
+    exit 3
+fi
+}
+
+check_updates() {
+#sudo apt-get update #actualiza la cache APT
+if [ "`python /usr/lib/update-notifier/apt-check`" != "0;0" ]; then
+    echo -e "Existen actualizaciones APT." 
+fi
+for repo_id in $(sqlite3 -batch -list $KNOTTY_DIR/knotty.db 'SELECT id FROM sources WHERE type = '\'git\'); do #para cada repo git en la base de datos
+    repo=$(sqlite3 -batch -list $KNOTTY_DIR/knotty.db 'SELECT alias FROM sources WHERE id = '\'$repo_id\')
+    if [ -d $KNOTTY_DIR/cache/git/$repo ]; then #si existe directorio para el repo
+        if [ "`git ls-remote $(sqlite3 -batch -list $KNOTTY_DIR/knotty.db 'SELECT uri FROM sources WHERE id = '\'$repo_id\') | grep HEAD | cut -f 1`" == "`sqlite3 -batch -list $KNOTTY_DIR/knotty.db 'SELECT version FROM sources WHERE id = '\'$repo_id\'`" ]; then
+            echo -e "Repositorio $repo actualizado."
+        else
+            echo -e "Descargando repositorio $repo."
+            cd $KNOTTY_DIR/cache/git/$repo
+            git pull
+            sqlite3 -batch $KNOTTY_DIR/knotty.db 'UPDATE sources SET version='$(git log --pretty=format:%H)' WHERE id = '\'$repo_id\' #actualiza version tabla sources
+        fi
+    else
+        echo -e "Clonando repositorio $repo."
+        cd $KNOTTY_DIR/cache/git/
+        git clone `sqlite3 -batch -list $KNOTTY_DIR/knotty.db 'SELECT uri FROM sources WHERE id = '\'$repo_id\'`
+        sqlite3 -batch $KNOTTY_DIR/knotty.db 'UPDATE sources SET version='$(git log --pretty=format:%H)' WHERE id = '\'$repo_id\' #actualiza version tabla sources
+    fi
+done
+for manual_id in $(sqlite3 -batch -list $KNOTTY_DIR/knotty.db 'SELECT id FROM sources WHERE type = '\'man\'); do #para cada descarga manual en la base de datos
+    manual=$(sqlite3 -batch -list $KNOTTY_DIR/knotty.db 'SELECT alias FROM sources WHERE id = '\'$manual_id\')
+    
+    
+done
+}
+
+while getopts "ciuhv" ARGS; do
+    case $ARGS in
+        c)
+            #check_db
+            #check_sourcefile
+            check_updates
+            ;;
+        i)
+            check_db
+            check_sourcefile
+            install_packages
+            ;;
+        u)
+            check_db
+            check_sourcefile
+            upgrade_packages
+            ;;
+        h)
+            usage
+            exit 0;;
+        v)
+            echo -e "knotty version $KNOTTY_VERSION"
+            exit 0;;
+        ?)
+            usage
+            exit 1;;
+    esac
+done
+
+
+# TODO
+
+#comprobar que hay una base de datos
+#no
+#    crear con estructura
+#comprobar que el archivo de fuentes se ha añadido a la base de datos
+#no
+#    parsear
+#    añadir a la base de datos
+#    marcar como procesado
+#procesar orden
+#c:
+#    actualizar lista apt -> puede saberse si hay actualizaciones??
+#    comprobar que existe repo git en cache
+#    si
+#        realizar git pull sobre repo y comprobar commit
+#    no
+#        realizar git clone sobre repo y guardar commit
+#    comprobar que url es igual a la previa
+#    no
+#        descargar y actualizar url
+#    guardar estado
+#i:
+    
